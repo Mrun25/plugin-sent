@@ -7,10 +7,12 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import org.mockito.stubbing.Answer;
 
 import io.kestra.core.http.HttpRequest;
 import io.kestra.core.http.HttpResponse;
@@ -18,16 +20,14 @@ import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.flows.Flow;
 import io.kestra.core.models.property.Property;
-import io.kestra.core.models.tasks.Output;
-import io.kestra.core.models.triggers.AbstractTrigger;
-import io.kestra.core.runners.RunContext;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.services.WebhookService;
 import io.kestra.core.utils.IdUtils;
-import io.kestra.plugin.core.trigger.AbstractWebhookTrigger;
 import io.kestra.plugin.core.trigger.WebhookContext;
 
 import jakarta.inject.Inject;
+
+import reactor.core.publisher.Mono;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -44,7 +44,9 @@ class EventTriggerTest {
 
     private EventTrigger trigger;
     private Flow flow;
-    private RecordingWebhookService recording;
+    private WebhookService recording;
+    private List<Execution> started;
+    private EventTrigger.Output output;
 
     @BeforeEach
     void setup() {
@@ -52,7 +54,39 @@ class EventTriggerTest {
             .key("test-url-key").signingSecret(Property.ofValue(SECRET)).build();
         flow = Flow.builder().id("sent_" + IdUtils.create()).namespace("qa.sent").revision(1)
             .tasks(List.of()).triggers(List.of(trigger)).build();
-        recording = new RecordingWebhookService();
+        started = new ArrayList<>();
+        output = null;
+        recording = recordingWebhookService(false, null);
+    }
+
+    // WebhookService.startExecution returns void on Kestra 1.3 and a Mono on Kestra 2.x, so a
+    // hand-written subclass can only compile against one of them. A Mockito answer adapts to
+    // the runtime signature, which keeps this suite runnable against both versions.
+    private WebhookService recordingWebhookService(boolean trackSubscription, AtomicBoolean subscribed) {
+        return Mockito.mock(WebhookService.class, (Answer<Object>) invocation -> {
+            var method = invocation.getMethod();
+            return switch (method.getName()) {
+                case "runContext" -> runContextFactory.of(Map.of());
+                case "newExecution" -> {
+                    output = (EventTrigger.Output) invocation.getArgument(3);
+                    yield webhookService.newExecution(
+                        invocation.getArgument(0),
+                        invocation.getArgument(1),
+                        invocation.getArgument(2),
+                        invocation.getArgument(3)
+                    );
+                }
+                case "startExecution" -> {
+                    started.add(invocation.getArgument(0));
+                    if (method.getReturnType().equals(void.class)) {
+                        yield null;
+                    }
+                    // Kestra 2.x: the returned Mono is lazy, so record subscription.
+                    yield trackSubscription ? Mono.fromRunnable(() -> subscribed.set(true)) : Mono.empty();
+                }
+                default -> throw new UnsupportedOperationException(method.getName());
+            };
+        });
     }
 
     @Test
@@ -61,7 +95,7 @@ class EventTriggerTest {
             .key("test-url-key").signingSecret(Property.ofValue(SECRET))
             .tolerance(Property.ofValue(Duration.ofHours(1).plusMillis(1))).build();
         assertEquals(HttpResponse.Status.BAD_REQUEST, evaluate(BODY, BODY, Instant.now().getEpochSecond(), false).getStatus());
-        assertTrue(recording.started.isEmpty());
+        assertTrue(started.isEmpty());
     }
 
     @Test
@@ -70,60 +104,60 @@ class EventTriggerTest {
             .key("test-url-key").signingSecret(Property.ofValue(SECRET))
             .tolerance(Property.ofValue(Duration.ofHours(1))).build();
         assertEquals(HttpResponse.Status.OK, evaluate(BODY, BODY, Instant.now().getEpochSecond(), false).getStatus());
-        assertEquals(1, recording.started.size());
+        assertEquals(1, started.size());
     }
 
     @Test
     void rejectsReplacementCharactersAfterHttpDecoding() throws Exception {
-        var body = BODY.replace("café", "\uFFFD");
+        var body = BODY.replace("café", "�");
         assertEquals(HttpResponse.Status.BAD_REQUEST, evaluate(body, body, Instant.now().getEpochSecond(), false).getStatus());
-        assertTrue(recording.started.isEmpty());
+        assertTrue(started.isEmpty());
     }
 
     @Test
     void validSignatureCreatesExecutionWithVerifiedOutput() throws Exception {
         var response = evaluate(BODY, BODY, Instant.now().getEpochSecond(), false);
         assertEquals(HttpResponse.Status.OK, response.getStatus());
-        assertEquals(1, recording.started.size());
-        var execution = recording.started.getFirst();
+        assertEquals(1, started.size());
+        var execution = started.getFirst();
         assertEquals(flow.getId(), execution.getFlowId());
         assertEquals(trigger.getId(), execution.getTrigger().getId());
-        assertEquals("message.received", recording.output.getEvent());
-        assertEquals("Test café", recording.output.getPayload().get("text"));
-        assertTrue(recording.output.getDedupeKey().startsWith("event:message.received:"));
+        assertEquals("message.received", output.getEvent());
+        assertEquals("Test café", output.getPayload().get("text"));
+        assertTrue(output.getDedupeKey().startsWith("event:message.received:"));
     }
 
     @Test
     void byteArrayBodyPreservesSignedUtf8() throws Exception {
         assertEquals(HttpResponse.Status.OK, evaluate(BODY, BODY, Instant.now().getEpochSecond(), true).getStatus());
-        assertEquals(1, recording.started.size());
-        assertEquals("Test café", recording.output.getPayload().get("text"));
+        assertEquals(1, started.size());
+        assertEquals("Test café", output.getPayload().get("text"));
     }
 
     @Test
     void tamperingCannotCreateAnExecution() throws Exception {
         assertEquals(HttpResponse.Status.UNAUTHORIZED, evaluate(BODY + " ", BODY, Instant.now().getEpochSecond(), false).getStatus());
-        assertTrue(recording.started.isEmpty());
-        assertNull(recording.output);
+        assertTrue(started.isEmpty());
+        assertNull(output);
     }
 
     @Test
     void staleSignatureCannotCreateAnExecution() throws Exception {
         assertEquals(HttpResponse.Status.UNAUTHORIZED, evaluate(BODY, BODY, Instant.now().getEpochSecond() - 600, false).getStatus());
-        assertTrue(recording.started.isEmpty());
+        assertTrue(started.isEmpty());
     }
 
     @Test
     void validButFilteredEventDoesNotCreateAnExecution() throws Exception {
         var delivered = BODY.replace("message.received", "message.delivered");
         assertEquals(HttpResponse.Status.NO_CONTENT, evaluate(delivered, delivered, Instant.now().getEpochSecond(), false).getStatus());
-        assertTrue(recording.started.isEmpty());
+        assertTrue(started.isEmpty());
     }
 
     @Test
     void signedNullJsonIsRejectedWithoutAnExecution() throws Exception {
         assertEquals(HttpResponse.Status.BAD_REQUEST, evaluate("null", "null", Instant.now().getEpochSecond(), false).getStatus());
-        assertTrue(recording.started.isEmpty());
+        assertTrue(started.isEmpty());
     }
 
     @Test
@@ -132,7 +166,19 @@ class EventTriggerTest {
             .body(HttpRequest.StringRequestBody.of(BODY)).build();
         var context = WebhookContext.builder().request(request).flow(flow).trigger(trigger).webhookService(recording).build();
         assertEquals(HttpResponse.Status.BAD_REQUEST, trigger.evaluate(context).block().getStatus());
-        assertTrue(recording.started.isEmpty());
+        assertTrue(started.isEmpty());
+    }
+
+    @Test
+    void subscribesToMonoReturnedOnKestra2x() throws Exception {
+        var subscribed = new AtomicBoolean(false);
+        recording = recordingWebhookService(true, subscribed);
+        assertEquals(HttpResponse.Status.OK, evaluate(BODY, BODY, Instant.now().getEpochSecond(), false).getStatus());
+        assertEquals(1, started.size());
+        var returnsVoid = WebhookService.class.getMethod("startExecution", Execution.class).getReturnType().equals(void.class);
+        // On Kestra 1.3 the method returns void, so there is nothing to subscribe to; on 2.x the
+        // trigger must subscribe, because a lazy Mono would otherwise never start the execution.
+        assertEquals(!returnsVoid, subscribed.get());
     }
 
     private HttpResponse<?> evaluate(String body, String signedBody, long timestamp, boolean bytes) throws Exception {
@@ -146,26 +192,5 @@ class EventTriggerTest {
             .build();
         var context = WebhookContext.builder().request(request).flow(flow).trigger(trigger).webhookService(recording).build();
         return trigger.evaluate(context).block();
-    }
-
-    private class RecordingWebhookService extends WebhookService {
-        private final List<Execution> started = new ArrayList<>();
-        private EventTrigger.Output output;
-
-        @Override
-        public RunContext runContext(Flow target, AbstractTrigger source) {
-            return runContextFactory.of(Map.of());
-        }
-
-        @Override
-        public Optional<Execution> newExecution(WebhookContext context, Flow target, AbstractWebhookTrigger source, Output value) {
-            output = (EventTrigger.Output) value;
-            return webhookService.newExecution(context, target, source, value);
-        }
-
-        @Override
-        public void startExecution(Execution execution) {
-            started.add(execution);
-        }
     }
 }

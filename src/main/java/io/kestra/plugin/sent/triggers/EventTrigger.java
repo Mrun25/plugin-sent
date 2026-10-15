@@ -1,5 +1,7 @@
 package io.kestra.plugin.sent.triggers;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.http.HttpHeaders;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -14,6 +16,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.kestra.core.http.HttpRequest;
 import io.kestra.core.http.HttpResponse;
+import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -21,6 +24,7 @@ import io.kestra.core.models.property.Property;
 import io.kestra.core.models.triggers.TriggerOutput;
 import io.kestra.core.queues.QueueException;
 import io.kestra.core.serializers.JacksonMapper;
+import io.kestra.core.services.WebhookService;
 import io.kestra.plugin.core.trigger.AbstractWebhookTrigger;
 import io.kestra.plugin.core.trigger.WebhookContext;
 
@@ -159,11 +163,42 @@ public class EventTrigger extends AbstractWebhookTrigger implements TriggerOutpu
             return Mono.just(HttpResponse.of(HttpResponse.Status.NO_CONTENT));
         }
         try {
-            context.webhookService().startExecution(maybeExecution.get());
+            startExecution(context.webhookService(), maybeExecution.get());
             return Mono.just(HttpResponse.of(HttpResponse.Status.OK));
         } catch (QueueException e) {
             return Mono.just(HttpResponse.of(HttpResponse.Status.INTERNAL_SERVER_ERROR));
         }
+    }
+
+    // WebhookService.startExecution returns void on Kestra 1.3 but a Mono on Kestra 2.x, and a
+    // JVM method descriptor includes the return type, so bytecode compiled against one version
+    // throws NoSuchMethodError on the other (issue #9). Resolve the method reflectively by name
+    // and parameters so the trigger starts executions on both generations.
+    private static void startExecution(WebhookService service, Execution execution) throws QueueException {
+        try {
+            var result = startExecutionMethod(service.getClass()).invoke(service, execution);
+            if (result instanceof Mono<?> mono) {
+                // Kestra 2.x returns a lazy Mono; subscribing is what starts the execution.
+                mono.block();
+            }
+        } catch (InvocationTargetException e) {
+            if (e.getCause() instanceof QueueException queueException) {
+                throw queueException;
+            }
+            throw new IllegalStateException("WebhookService.startExecution failed.", e.getCause());
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            throw new IllegalStateException("WebhookService.startExecution is unavailable on this Kestra version.", e);
+        }
+    }
+
+    private static Method startExecutionMethod(Class<?> type) throws NoSuchMethodException {
+        for (var method : type.getMethods()) {
+            if (method.getName().equals("startExecution") && method.getParameterCount() == 1
+                && method.getParameterTypes()[0].isAssignableFrom(Execution.class)) {
+                return method;
+            }
+        }
+        throw new NoSuchMethodException("startExecution(Execution)");
     }
 
     static boolean accepts(List<String> selected, String field, String event) {
