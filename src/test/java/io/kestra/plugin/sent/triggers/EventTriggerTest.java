@@ -20,13 +20,13 @@ import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.flows.Flow;
 import io.kestra.core.models.property.Property;
+import io.kestra.core.queues.QueueException;
 import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.services.WebhookService;
 import io.kestra.core.utils.IdUtils;
 import io.kestra.plugin.core.trigger.WebhookContext;
 
 import jakarta.inject.Inject;
-
 import reactor.core.publisher.Mono;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -63,7 +63,12 @@ class EventTriggerTest {
     // hand-written subclass can only compile against one of them. A Mockito answer adapts to
     // the runtime signature, which keeps this suite runnable against both versions.
     private WebhookService recordingWebhookService(boolean trackSubscription, AtomicBoolean subscribed) {
-        return Mockito.mock(WebhookService.class, (Answer<Object>) invocation -> {
+        return recordingWebhookService(trackSubscription, subscribed, null);
+    }
+
+    private WebhookService recordingWebhookService(boolean trackSubscription, AtomicBoolean subscribed, QueueException failure) {
+        return Mockito.mock(WebhookService.class, (Answer<Object>) invocation ->
+        {
             var method = invocation.getMethod();
             return switch (method.getName()) {
                 case "runContext" -> runContextFactory.of(Map.of());
@@ -77,6 +82,14 @@ class EventTriggerTest {
                     );
                 }
                 case "startExecution" -> {
+                    if (failure != null) {
+                        // Kestra 1.3 signals the failure synchronously; Kestra 2.x signals it on
+                        // the returned Mono. The same exception object drives both paths.
+                        if (method.getReturnType().equals(void.class)) {
+                            throw failure;
+                        }
+                        yield Mono.error(failure);
+                    }
                     started.add(invocation.getArgument(0));
                     if (method.getReturnType().equals(void.class)) {
                         yield null;
@@ -109,7 +122,7 @@ class EventTriggerTest {
 
     @Test
     void rejectsReplacementCharactersAfterHttpDecoding() throws Exception {
-        var body = BODY.replace("café", "�");
+        var body = BODY.replace("café", "\uFFFD");
         assertEquals(HttpResponse.Status.BAD_REQUEST, evaluate(body, body, Instant.now().getEpochSecond(), false).getStatus());
         assertTrue(started.isEmpty());
     }
@@ -166,6 +179,17 @@ class EventTriggerTest {
             .body(HttpRequest.StringRequestBody.of(BODY)).build();
         var context = WebhookContext.builder().request(request).flow(flow).trigger(trigger).webhookService(recording).build();
         assertEquals(HttpResponse.Status.BAD_REQUEST, trigger.evaluate(context).block().getStatus());
+        assertTrue(started.isEmpty());
+    }
+
+    @Test
+    void startExecutionFailureMapsTo500WithoutThrowing() throws Exception {
+        // On Kestra 1.3 the QueueException is thrown synchronously; on 2.x it is signalled on
+        // the returned Mono. Either way evaluate must answer 500 and never let the exception
+        // escape, so the controller cannot emit a second command for the same execution.
+        recording = recordingWebhookService(false, null, new QueueException("start failed"));
+        var response = evaluate(BODY, BODY, Instant.now().getEpochSecond(), false);
+        assertEquals(HttpResponse.Status.INTERNAL_SERVER_ERROR, response.getStatus());
         assertTrue(started.isEmpty());
     }
 
