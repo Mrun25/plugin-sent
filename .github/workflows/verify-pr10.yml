@@ -19,5 +19,8 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: gradle
+      - name: retarget build to JVM 25 for kestra 2.x dependency resolution
+        if: matrix.kv == '2.0.2'
+        run: sed -i 's/JavaVersion.VERSION_21/JavaVersion.VERSION_25/' build.gradle
       - name: gradle check (kestra ${{ matrix.kv }})
         run: ./gradlew check -PkestraVersion=${{ matrix.kv }} --console=plain --stacktrace
