@@ -163,24 +163,20 @@ public class EventTrigger extends AbstractWebhookTrigger implements TriggerOutpu
             return Mono.just(HttpResponse.of(HttpResponse.Status.NO_CONTENT));
         }
         try {
-            // The execution Mono is returned rather than blocked on: on Kestra 2.x its error
-            // signal (for example a start timeout) is mapped to a 500 so no exception escapes
-            // evaluate and the controller cannot double-start the execution (issue #9).
-            return startExecution(context.webhookService(), maybeExecution.get())
-                .<HttpResponse<?>> thenReturn(HttpResponse.of(HttpResponse.Status.OK))
-                .onErrorReturn(HttpResponse.of(HttpResponse.Status.INTERNAL_SERVER_ERROR));
+            return toResponse(startExecution(context.webhookService(), maybeExecution.get()));
         } catch (QueueException e) {
             return Mono.just(HttpResponse.of(HttpResponse.Status.INTERNAL_SERVER_ERROR));
         }
     }
 
-    // WebhookService.startExecution returns void on Kestra 1.3 but a Mono on Kestra 2.x, and a
-    // JVM method descriptor includes the return type, so bytecode compiled against one version
-    // throws NoSuchMethodError on the other (issue #9). The method is resolved once,
-    // reflectively, on WebhookService itself so proxies and subclasses cannot break the lookup,
-    // and the call is exposed as a Mono on both generations: the 2.x Mono is returned as-is so
-    // its completion and error signals reach the caller, while the 1.3 void call is an
-    // already-completed empty Mono.
+    // Any Mono error (QueueException, 2.x start TimeoutException) maps to 500 so nothing escapes evaluate (issue #9).
+    static Mono<HttpResponse<?>> toResponse(Mono<Void> started) {
+        return started
+            .<HttpResponse<?>> thenReturn(HttpResponse.of(HttpResponse.Status.OK))
+            .onErrorReturn(HttpResponse.of(HttpResponse.Status.INTERNAL_SERVER_ERROR));
+    }
+
+    // 1.3 returns void, 2.x a Mono: resolved reflectively so one JAR runs on both (issue #9)
     private static final Method START_EXECUTION_METHOD = findStartExecutionMethod();
 
     private static Method findStartExecutionMethod() {
@@ -197,8 +193,6 @@ public class EventTrigger extends AbstractWebhookTrigger implements TriggerOutpu
         try {
             var result = START_EXECUTION_METHOD.invoke(service, execution);
             if (result instanceof Mono<?> mono) {
-                // Kestra 2.x returns a lazy Mono; the caller's subscription is what starts the
-                // execution, and the Mono completes or fails with the start outcome.
                 return mono.then();
             }
             return Mono.empty();

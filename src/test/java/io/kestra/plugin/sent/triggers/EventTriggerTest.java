@@ -7,6 +7,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -59,9 +60,7 @@ class EventTriggerTest {
         recording = recordingWebhookService(false, null);
     }
 
-    // WebhookService.startExecution returns void on Kestra 1.3 and a Mono on Kestra 2.x, so a
-    // hand-written subclass can only compile against one of them. A Mockito answer adapts to
-    // the runtime signature, which keeps this suite runnable against both versions.
+    // startExecution is void on 1.3 and a Mono on 2.x: a Mockito answer adapts to either
     private WebhookService recordingWebhookService(boolean trackSubscription, AtomicBoolean subscribed) {
         return recordingWebhookService(trackSubscription, subscribed, null);
     }
@@ -83,8 +82,7 @@ class EventTriggerTest {
                 }
                 case "startExecution" -> {
                     if (failure != null) {
-                        // Kestra 1.3 signals the failure synchronously; Kestra 2.x signals it on
-                        // the returned Mono. The same exception object drives both paths.
+                        // 1.3 throws synchronously, 2.x signals on the Mono
                         if (method.getReturnType().equals(void.class)) {
                             throw failure;
                         }
@@ -94,7 +92,7 @@ class EventTriggerTest {
                     if (method.getReturnType().equals(void.class)) {
                         yield null;
                     }
-                    // Kestra 2.x: the returned Mono is lazy, so record subscription.
+                    // 2.x Mono is lazy: record subscription
                     yield trackSubscription ? Mono.fromRunnable(() -> subscribed.set(true)) : Mono.empty();
                 }
                 default -> throw new UnsupportedOperationException(method.getName());
@@ -184,9 +182,6 @@ class EventTriggerTest {
 
     @Test
     void startExecutionFailureMapsTo500WithoutThrowing() throws Exception {
-        // On Kestra 1.3 the QueueException is thrown synchronously; on 2.x it is signalled on
-        // the returned Mono. Either way evaluate must answer 500 and never let the exception
-        // escape, so the controller cannot emit a second command for the same execution.
         recording = recordingWebhookService(false, null, new QueueException("start failed"));
         var response = evaluate(BODY, BODY, Instant.now().getEpochSecond(), false);
         assertEquals(HttpResponse.Status.INTERNAL_SERVER_ERROR, response.getStatus());
@@ -200,9 +195,26 @@ class EventTriggerTest {
         assertEquals(HttpResponse.Status.OK, evaluate(BODY, BODY, Instant.now().getEpochSecond(), false).getStatus());
         assertEquals(1, started.size());
         var returnsVoid = WebhookService.class.getMethod("startExecution", Execution.class).getReturnType().equals(void.class);
-        // On Kestra 1.3 the method returns void, so there is nothing to subscribe to; on 2.x the
-        // trigger must subscribe, because a lazy Mono would otherwise never start the execution.
+        // 2.x only: a lazy Mono never starts the execution unless subscribed
         assertEquals(!returnsVoid, subscribed.get());
+    }
+
+    @Test
+    void toResponseMapsQueueExceptionTo500() {
+        var response = EventTrigger.toResponse(Mono.error(new QueueException("start failed"))).block();
+        assertEquals(HttpResponse.Status.INTERNAL_SERVER_ERROR, response.getStatus());
+    }
+
+    @Test
+    void toResponseMapsTimeoutTo500() {
+        var response = EventTrigger.toResponse(Mono.error(new TimeoutException())).block();
+        assertEquals(HttpResponse.Status.INTERNAL_SERVER_ERROR, response.getStatus());
+    }
+
+    @Test
+    void toResponseMapsCompletionToOk() {
+        var response = EventTrigger.toResponse(Mono.empty()).block();
+        assertEquals(HttpResponse.Status.OK, response.getStatus());
     }
 
     private HttpResponse<?> evaluate(String body, String signedBody, long timestamp, boolean bytes) throws Exception {
